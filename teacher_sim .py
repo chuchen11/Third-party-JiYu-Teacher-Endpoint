@@ -119,7 +119,7 @@ MAGIC_NAMES = {
     0x434E414E: 'NANC',
     0x434E4143: 'CANC',
     0x41434157: 'WACA',
-    0x53524E54: 'TNRS',
+    0x544E5253: 'SRNT',
     0x434F4D44: 'DMOC',
     0x544E504C: 'LPNT',
     0x4143414B: 'KACA',
@@ -136,7 +136,13 @@ MAGIC_NAMES = {
 ROUTINE_MAGICS = {0x434E4F4F, 0x434E414E, 0x434E4143, 0x4F4E4E41}
 
 students = {}
-previews = {}   # sip -> {'total':int, 'buf':bytearray, 'got':int}
+previews = {}   # sip -> 当前正在重组的 LANT 帧
+completed_preview_frames = {}  # sip -> 最近完整接收的帧序号
+preview_policy_versions = {}   # sip -> 最近发送的 LPNT policy version
+remote_views = {}  # sip -> RemoteViewSession
+remote_controls = {}  # sip -> {'port': int, 'sock': socket.socket}
+remote_view_failures = {}  # sip -> 最近失败时间；避免反复触发学生端编码器
+remote_state_lock = threading.RLock()
 last_status = {}  # (sip, key) -> 最近一条同类消息内容（重复降为 DEBUG，防止刷屏）
 running = True
 SELECTED_NETWORK = None
@@ -374,6 +380,33 @@ def get_channel_id():
 CHANNEL_ID = get_channel_id()
 
 
+def get_env_int(name, default, minimum=0, maximum=0xFFFF):
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw, 0)
+    except ValueError as e:
+        raise ValueError(f'{name} 不是有效整数：{raw}') from e
+    if not minimum <= value <= maximum:
+        raise ValueError(f'{name} 必须在 {minimum} 到 {maximum} 之间')
+    return value
+
+
+# V6 的连续桌面观看走 TCP/UMSP；4806 是原版默认通信端口。
+TCP_COMM_MODE = get_env_int('TEACHER_TCP_MODE', 1, 0, 1)
+TCP_COMM_PORT = get_env_int('TEACHER_TCP_PORT', 4806, 1, 0xFFFF)
+# 远控接收端口位于学生机上。0 表示每次从动态端口段随机选择，避免和
+# 学生端自身服务或上一次异常退出残留的接收线程争用固定端口。
+CONTROL_PORT = get_env_int('TEACHER_CONTROL_PORT', 0, 0, 0xFFFF)
+# 官方协议：0=Share（双方可操作），1=Monitor，2=Control Student（额外锁定学生输入）。
+# 官方 control 分支会先初始化输入 Hook；默认使用 mode=2，确保键盘模拟路径已初始化。
+# 如需保留学生端本地输入，可显式设置 TEACHER_CONTROL_MODE=0。
+CONTROL_MODE = get_env_int('TEACHER_CONTROL_MODE', 2, 0, 2)
+REMOTE_CONTROL_ENABLED = os.environ.get('TEACHER_ENABLE_REMOTE_CONTROL', '1').strip() != '0'
+VIEW_START_DELAY = get_env_int('TEACHER_VIEW_START_DELAY_MS', 0, 0, 10000) / 1000.0
+VIEW_FAILURE_COOLDOWN = get_env_int('TEACHER_VIEW_COOLDOWN', 60, 5, 3600)
+REMOTE_VIEW_DIR = os.path.join(LOG_DIR, 'teacher_remote_view')
+
+
 def get_session_endpoint(channel):
     """按教师端公式计算频道对应的会话组播地址和 UDP 端口。"""
     return (f'{SESSION_MCAST_PREFIX}.{channel + 1}.1',
@@ -381,6 +414,8 @@ def get_session_endpoint(channel):
 
 
 SMCAST, SPORT = get_session_endpoint(CHANNEL_ID)
+VIEW_LOCAL_PORT = get_env_int('TEACHER_VIEW_LOCAL_PORT', SPORT, 1, 0xFFFF)
+VIEW_PEER_PORT = get_env_int('TEACHER_VIEW_PEER_PORT', SPORT, 1, 0xFFFF)
 DIRECT_PEER_IP = os.environ.get('TEACHER_PEER_IP', '').strip() or None
 
 def build_announce_targets(group, port):
@@ -519,15 +554,1057 @@ def waca(sip):
 
 
 def request_preview(sip):
-    """主动请求学生端发送预览缩略图 (TNRS)。"""
-    tg = bytes.fromhex('aa3a8dbe2b906645908ea29526218540')
-    pkt = struct.pack('<II', 0x53524E54, 0x10000) + struct.pack('<I', 16) + tg
-    pkt += struct.pack('<IIII', 0x48, 1, 0, 0x100)
-    logger.info('[Preview] TNRS -> %s, len=%d', sip, len(pkt))
+    """通过一次 LPNT 关/开切换，立即请求新的预览帧。"""
+    version = preview_policy_versions.get(sip, 3)
+    stop_version = version + 1
+    start_version = version + 2
+    preview_policy_versions[sip] = start_version
     try:
-        sock.sendto(pkt, (sip, PORT))
+        sock.sendto(build_lpnt(stop_version, False), (sip, PORT))
+        time.sleep(0.05)
+        sock.sendto(build_lpnt(start_version, True), (sip, PORT))
+        logger.info('[Preview] LPNT restart -> %s, versions=%d/%d',
+                    sip, stop_version, start_version)
     except Exception as e:
-        logger.error('[Preview] TNRS 发送给 %s 失败：%s', sip, e, exc_info=True)
+        logger.error('[Preview] LPNT restart 发送给 %s 失败：%s', sip, e, exc_info=True)
+
+
+def build_mess_packet(sip, payload):
+    """构造单接收者 MESS；recipient IP 使用协议中的原始网络序字节。"""
+    socket.inet_aton(sip)
+    return (struct.pack('<III', 0x5353454D, 1, 1)
+            + socket.inet_aton(sip)
+            + payload)
+
+
+def build_command_transaction(payload):
+    """构造 CCommandTransaction 使用的 COMD 外层。"""
+    if len(payload) > 0x800:
+        raise ValueError('CCommandTransaction payload 不能超过 2048 字节')
+    packet = (struct.pack('<III', 0x434F4D44, 0x10000,
+                          len(payload) + 13)
+              + uuid.uuid4().bytes_le
+              + struct.pack('<I', 20000)
+              + socket.inet_aton(ip)
+              + struct.pack('<I', len(payload))
+              + payload
+              + b'\x00')
+    if len(packet) != len(payload) + 41:
+        raise AssertionError('COMD 命令事务长度错误')
+    return packet
+
+
+def build_remote_view_payload(sip):
+    """构造远程观看 feature 8 的 617 字节内部负载。"""
+    params = bytearray(604)
+    struct.pack_into('<I', params, 0, 0)  # RemoteWithVoice
+    params[4:8] = socket.inet_aton(ip)
+    # 这里是教师会话/桌面监控端点，不是学生端的 TCP 服务端口 4806。
+    struct.pack_into('<H', params, 8, VIEW_LOCAL_PORT)
+    params[10:14] = socket.inet_aton(ip)
+    struct.pack_into('<H', params, 14, VIEW_PEER_PORT)
+    struct.pack_into('<IIIIIIII', params, 36,
+                     1,      # NetworkType
+                     1,      # ShowMonitorControlMessage
+                     20480,  # MaxSendSpeed
+                     1,      # RepairMode
+                     1440,   # MaxPacketSize
+                     25,     # FrameLimit
+                     75,     # CaptureQuality
+                     1)      # TcpCommMode
+    params[68:72] = socket.inet_aton(sip)
+    struct.pack_into('<III', params, 72, 5, 12, 16)
+    payload = struct.pack('<III', 617, 8, 0x80000000) + params + b'\x00'
+    if len(payload) != 617:
+        raise AssertionError(f'feature 8 长度错误：{len(payload)}')
+    return payload
+
+
+def build_remote_view_stop_payload():
+    return struct.pack('<III', 13, 0, 0) + b'\x00'
+
+
+def send_remote_view_feature(sip, enabled=True):
+    payload = (build_remote_view_payload(sip) if enabled
+               else build_remote_view_stop_payload())
+    packet = build_mess_packet(sip, payload)
+    sock2.sendto(packet, (sip, SPORT))
+    logger.info('[RemoteView] feature %s -> %s:%d, payload=%d, mess=%d',
+                'start' if enabled else 'stop', sip, SPORT,
+                len(payload), len(packet))
+
+
+class RemoteViewSession:
+    """V6 TCP/UMSP channel 10 接收器及 libTDDesk2 桌面帧重组器。"""
+
+    UMSP_VERSION = 0x10000
+    UMSP_SELECT_MAGIC = 0x4F434853  # wire: SHCO
+    UMSP_DATA_MAGIC = 0x43504B54    # wire: TKPC (代码常量名 TCPK)
+    DESK_CHANNEL = 10
+    MAX_FRAME_SIZE = 0x241800
+
+    def __init__(self, sip, port):
+        self.sip = sip
+        self.port = port
+        self.stop_event = threading.Event()
+        self.connected_event = threading.Event()
+        self.conn = None
+        self.thread = None
+        self.fragments = {}
+        self.frame_count = 0
+        self.control_record_count = 0
+        self.remote_cursor = None
+        self.remote_cursor_version = 0
+        self.local_cursor = None
+        self.local_cursor_version = 0
+        self.last_local_cursor_at = 0.0
+        self.last_cursor_log = 0.0
+        self.player = None
+        self.player_format = None
+        self.player_kind = None
+        self.player_size = None
+        self.viewer_thread = None
+        self.player_unavailable = False
+        self.interactive_requested = False
+        self.dump_stream = os.environ.get('TEACHER_VIEW_DUMP', '0').strip() == '1'
+        self.base_name = sip.replace('.', '_')
+        self.session_tag = time.strftime('%Y%m%d-%H%M%S')
+
+    def start(self):
+        self.thread = threading.Thread(
+            target=self.run, name=f'view-{self.base_name}', daemon=True
+        )
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        conn = self.conn
+        if conn is not None:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        self._stop_player()
+
+    def enable_interactive_player(self):
+        """立即退出纯播放窗口，下一帧改用带输入绑定的内嵌窗口。"""
+        self.interactive_requested = True
+        if self.player_kind in ('ffplay', 'opencv-h264'):
+            self._stop_player()
+
+    def _connect(self):
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.settimeout(2.5)
+        try:
+            conn.bind((ip, 0))
+            conn.connect((self.sip, self.port))
+            hello = struct.pack('<IIIII', self.UMSP_VERSION,
+                                self.UMSP_SELECT_MAGIC, 8, 1,
+                                self.DESK_CHANNEL)
+            conn.sendall(hello)
+            conn.settimeout(1.0)
+            self.conn = conn
+            self.connected_event.set()
+            with remote_state_lock:
+                remote_view_failures.pop(self.sip, None)
+            logger.info('[RemoteView] TCP 已连接 %s:%d，SHCO channel=%d',
+                        self.sip, self.port, self.DESK_CHANNEL)
+            return conn
+        except OSError:
+            conn.close()
+            raise
+
+    def run(self):
+        try:
+            # 立即订阅 channel 10，避免错过编码器最初的 SPS/PPS/IDR。
+            if self.stop_event.wait(VIEW_START_DELAY):
+                return
+            conn = self._connect()
+            stream = bytearray()
+            while running and not self.stop_event.is_set():
+                try:
+                    chunk = conn.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    raise ConnectionError('学生端关闭 TCP 连接')
+                stream.extend(chunk)
+                while len(stream) >= 12:
+                    version, magic, payload_len = struct.unpack_from('<III', stream)
+                    if payload_len > self.MAX_FRAME_SIZE + 0x10000:
+                        raise ValueError(f'UMSP payload 过大：{payload_len}')
+                    packet_len = 12 + payload_len
+                    if len(stream) < packet_len:
+                        break
+                    payload = bytes(stream[12:packet_len])
+                    del stream[:packet_len]
+                    if version != self.UMSP_VERSION:
+                        logger.warning('[RemoteView] UMSP version=%#x（预期 %#x）',
+                                       version, self.UMSP_VERSION)
+                    if magic != self.UMSP_DATA_MAGIC:
+                        logger.debug('[RemoteView] 忽略 UMSP magic=%#x len=%d',
+                                     magic, payload_len)
+                        continue
+                    if len(payload) < 4:
+                        logger.warning('[RemoteView] TCPK payload 过短：%d', len(payload))
+                        continue
+                    channel = struct.unpack_from('<I', payload)[0]
+                    if channel == self.DESK_CHANNEL:
+                        self._handle_fragment(payload[4:])
+                    else:
+                        logger.debug('[RemoteView] 忽略 channel=%d len=%d',
+                                     channel, len(payload) - 4)
+        except Exception as e:
+            if not self.stop_event.is_set():
+                with remote_state_lock:
+                    remote_view_failures[self.sip] = time.monotonic()
+                logger.error('[RemoteView] %s 接收结束：%s', self.sip, e,
+                             exc_info=True)
+                print(f'[观看] {self.sip} 接收失败：{e}')
+                print(f'[观看] 已停止请求；{VIEW_FAILURE_COOLDOWN} 秒内不会再次启动，避免学生端反复闪退')
+                try:
+                    send_remote_view_feature(self.sip, False)
+                except OSError as stop_error:
+                    logger.warning('[RemoteView] 向 %s 发送失败清理包失败：%s',
+                                   self.sip, stop_error)
+        finally:
+            self.stop()
+            with remote_state_lock:
+                if remote_views.get(self.sip) is self:
+                    remote_views.pop(self.sip, None)
+            logger.info('[RemoteView] %s 会话退出，共完成 %d 帧',
+                        self.sip, self.frame_count)
+
+    def _handle_fragment(self, data):
+        if len(data) < 12:
+            logger.warning('[RemoteView] 桌面分片过短：%d', len(data))
+            return
+        frame_seq, offset, total = struct.unpack_from('<III', data)
+        fragment = data[12:]
+        if not 1 <= total <= self.MAX_FRAME_SIZE:
+            logger.warning('[RemoteView] 非法桌面帧大小：seq=%d total=%d',
+                           frame_seq, total)
+            return
+        if offset > total or len(fragment) > total - offset:
+            logger.warning('[RemoteView] 非法分片：seq=%d off=%d len=%d total=%d',
+                           frame_seq, offset, len(fragment), total)
+            return
+        state = self.fragments.get(frame_seq)
+        if state is None or state['total'] != total:
+            state = {
+                'total': total,
+                'data': bytearray(total),
+                'seen': bytearray(total),
+                'received': 0,
+            }
+            self.fragments[frame_seq] = state
+            if len(self.fragments) > 4:
+                oldest = next(iter(self.fragments))
+                if oldest != frame_seq:
+                    self.fragments.pop(oldest, None)
+        end = offset + len(fragment)
+        new_bytes = len(fragment) - sum(state['seen'][offset:end])
+        state['data'][offset:end] = fragment
+        state['seen'][offset:end] = b'\x01' * len(fragment)
+        state['received'] += new_bytes
+        if state['received'] == total:
+            record = bytes(state['data'])
+            self.fragments.pop(frame_seq, None)
+            self._handle_record(frame_seq, record)
+
+    def _handle_record(self, frame_seq, record):
+        if len(record) < 64:
+            self.control_record_count += 1
+            if len(record) >= 16 and record[:4] == b'SPUC':
+                record_size, timestamp, packed_position = struct.unpack_from(
+                    '<III', record, 4
+                )
+                cursor = (packed_position & 0xFFFF,
+                          (packed_position >> 16) & 0xFFFF)
+                if record_size == 16 and cursor != self.remote_cursor:
+                    self.remote_cursor = cursor
+                    self.remote_cursor_version += 1
+                    with remote_state_lock:
+                        control_active = self.sip in remote_controls
+                    now = time.monotonic()
+                    if control_active and now - self.last_cursor_log >= 0.1:
+                        self.last_cursor_log = now
+                        logger.info('[RemoteControl] 学生端光标 -> %s (%d,%d) ts=%d',
+                                    self.sip, cursor[0], cursor[1], timestamp)
+            if self.control_record_count == 1 or self.control_record_count % 100 == 0:
+                logger.info('[RemoteView] 控制记录 count=%d seq=%d len=%d data=%s',
+                            self.control_record_count, frame_seq, len(record),
+                            record.hex(' '))
+            return
+        magic, declared_size, timestamp = struct.unpack_from('<III', record)
+        encoded_rect = struct.unpack_from('<iiii', record, 12)
+        visible_rect = struct.unpack_from('<iiii', record, 28)
+        frame_type = struct.unpack_from('<I', record, 44)[0]
+        payload = record[64:]
+        width = abs(encoded_rect[2] - encoded_rect[0])
+        height = abs(encoded_rect[3] - encoded_rect[1])
+        visible_width = abs(visible_rect[2] - visible_rect[0])
+        visible_height = abs(visible_rect[3] - visible_rect[1])
+        if not width or not height:
+            width = visible_width
+            height = visible_height
+        if not 0 < visible_width <= width:
+            visible_width = width
+        if not 0 < visible_height <= height:
+            visible_height = height
+        self.frame_count += 1
+        os.makedirs(REMOTE_VIEW_DIR, exist_ok=True)
+
+        if magic == 0x46524848:  # wire HHRF, H.264 Annex-B
+            self._write_player('h264', payload, width, height,
+                               visible_width, visible_height)
+            if self.dump_stream or self.player_unavailable:
+                path = os.path.join(REMOTE_VIEW_DIR,
+                                    f'remote_{self.base_name}_{self.session_tag}.h264')
+                with open(path, 'ab') as f:
+                    f.write(payload)
+            codec = 'H264'
+        elif magic == 0x46524A48:  # wire HJRF, JPEG
+            soi = payload.find(b'\xff\xd8')
+            jpeg = payload[soi:] if soi >= 0 else payload
+            path = os.path.join(REMOTE_VIEW_DIR,
+                                f'remote_{self.base_name}_latest.jpg')
+            with open(path, 'wb') as f:
+                f.write(jpeg)
+            self._write_player('mjpeg', jpeg, width, height,
+                               visible_width, visible_height)
+            codec = 'JPEG'
+        elif magic == 0x46524D48:  # wire HMRF, legacy
+            path = os.path.join(REMOTE_VIEW_DIR,
+                                f'remote_{self.base_name}_latest.hmrf')
+            with open(path, 'wb') as f:
+                f.write(record)
+            codec = 'HMRF'
+        else:
+            logger.warning('[RemoteView] 未知桌面记录 magic=%#x seq=%d len=%d',
+                           magic, frame_seq, len(record))
+            return
+
+        if self.frame_count == 1 or self.frame_count % 100 == 0:
+            logger.info('[RemoteView] %s %s frame=%d seq=%d type=%d '
+                        'record=%d declared=%d ts=%d encoded=%s visible=%s',
+                        self.sip, codec, self.frame_count, frame_seq, frame_type,
+                        len(record), declared_size, timestamp,
+                        encoded_rect, visible_rect)
+
+    def _write_player(self, fmt, data, width, height,
+                      visible_width=None, visible_height=None):
+        if not data or self.player_unavailable:
+            return
+        output_width = visible_width or width
+        output_height = visible_height or height
+        wanted_size = (output_width, output_height)
+        video_filter = ('shuffleplanes=0:2:1:3,'
+                        f'crop={output_width}:{output_height}:0:0')
+        if (self.player is None or self.player_format != fmt
+                or (self.player_kind == 'opencv-h264'
+                    and self.player_size != wanted_size)
+                or (self.player_kind == 'pillow-h264'
+                    and self.player_size != wanted_size)):
+            self._stop_player()
+            # H.264 从首帧开始固定使用内嵌窗口。观看切换到控制时复用同一个
+            # 解码器，避免在码流中途重启而错过 SPS/PPS/IDR 后永久黑屏。
+            if not self._start_opencv_player(
+                    fmt, width, height, output_width, output_height,
+                    interactive=(fmt == 'h264')):
+                self.player_unavailable = True
+                logger.warning('[RemoteView] 实时播放器不可用；帧保存在 %s',
+                               REMOTE_VIEW_DIR)
+                return
+        if self.player_kind == 'opencv-jpeg':
+            try:
+                import cv2
+                import numpy as np
+                frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8),
+                                     cv2.IMREAD_COLOR)
+                if frame is not None:
+                    cv2.imshow(f'学生屏幕 {self.sip}', frame)
+                    cv2.waitKey(1)
+            except Exception as e:
+                logger.warning('[RemoteView] OpenCV JPEG 显示失败：%s', e)
+                self.player_unavailable = True
+            return
+        try:
+            self.player.stdin.write(data)
+            self.player.stdin.flush()
+        except (BrokenPipeError, OSError, AttributeError):
+            logger.warning('[RemoteView] 视频解码器管道已关闭，停止播放器重启')
+            self.player_unavailable = True
+            self._stop_player()
+
+    def _start_opencv_player(self, fmt, width, height,
+                             output_width=None, output_height=None,
+                             interactive=False):
+        try:
+            output_width = output_width or width
+            output_height = output_height or height
+            if fmt == 'mjpeg':
+                import cv2  # noqa: F401
+                self.player = 'opencv-jpeg'
+                self.player_format = fmt
+                self.player_kind = 'opencv-jpeg'
+                self.player_size = (output_width, output_height)
+                logger.info('[RemoteView] 使用 OpenCV 显示 JPEG：%s', self.sip)
+                return True
+            if width <= 0 or height <= 0:
+                raise ValueError(f'无效画面尺寸 {width}x{height}')
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            try:
+                if interactive:
+                    raise ImportError('远控模式使用内嵌窗口')
+                import cv2  # noqa: F401
+                pixel_format = 'bgr24'
+                player_kind = 'opencv-h264'
+                reader = self._opencv_h264_reader
+                display_name = 'OpenCV'
+            except ImportError:
+                import tkinter  # noqa: F401
+                from PIL import ImageTk  # noqa: F401
+                pixel_format = 'rgb24'
+                player_kind = 'pillow-h264'
+                reader = self._pillow_h264_reader
+                display_name = 'Pillow/Tkinter'
+            self.player = subprocess.Popen(
+                [ffmpeg, '-loglevel', 'error', '-flags', 'low_delay',
+                 '-threads', '1',
+                 '-probesize', '32', '-analyzeduration', '0',
+                 '-f', 'h264', '-i', 'pipe:0',
+                 '-an', '-vf',
+                 f'shuffleplanes=0:2:1:3,'
+                 f'crop={output_width}:{output_height}:0:0',
+                 '-f', 'rawvideo', '-pix_fmt', pixel_format, 'pipe:1'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+            self.player_format = fmt
+            self.player_kind = player_kind
+            self.player_size = (output_width, output_height)
+            player = self.player
+            self.viewer_thread = threading.Thread(
+                target=reader,
+                args=(player, output_width, output_height),
+                name=f'view-ui-{self.base_name}', daemon=True,
+            )
+            self.viewer_thread.start()
+            threading.Thread(
+                target=self._ffmpeg_stderr_reader,
+                args=(player,), name=f'view-ffmpeg-{self.base_name}', daemon=True,
+            ).start()
+            logger.info('[RemoteView] 使用 bundled FFmpeg + %s 显示 H264：%s '
+                        'encoded=%dx%d visible=%dx%d', display_name, self.sip,
+                        width, height, output_width, output_height)
+            return True
+        except Exception as e:
+            logger.warning('[RemoteView] OpenCV/FFmpeg 播放器启动失败：%s', e,
+                           exc_info=True)
+            self.player = None
+            self.player_kind = None
+            return False
+
+    def _ffmpeg_stderr_reader(self, player):
+        count = 0
+        try:
+            while player is self.player and player.stderr:
+                raw = player.stderr.readline()
+                if not raw:
+                    return
+                count += 1
+                if count <= 20 or count % 100 == 0:
+                    message = raw.decode('utf-8', errors='replace').strip()
+                    if message:
+                        logger.warning('[RemoteView] FFmpeg：%s', message)
+        except (OSError, AttributeError):
+            pass
+
+    def _pillow_h264_reader(self, player, width, height):
+        frame_size = width * height * 3
+        root = None
+        closed = threading.Event()
+        try:
+            import queue
+            import tkinter as tk
+            from PIL import ImageDraw, ImageTk
+            frames = queue.Queue(maxsize=1)
+            reader_done = threading.Event()
+
+            def read_decoded_frames():
+                try:
+                    while not self.stop_event.is_set() and player is self.player:
+                        chunks = bytearray()
+                        while len(chunks) < frame_size:
+                            chunk = player.stdout.read(frame_size - len(chunks))
+                            if not chunk:
+                                return
+                            chunks.extend(chunk)
+                        try:
+                            frames.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            frames.put_nowait(bytes(chunks))
+                        except queue.Full:
+                            pass
+                finally:
+                    reader_done.set()
+
+            root = tk.Tk()
+            label = tk.Label(root, text='正在等待视频画面...', width=60,
+                             height=20, borderwidth=0, highlightthickness=0,
+                             padx=0, pady=0, takefocus=True,
+                             bg='black', fg='white', cursor='none')
+            label.pack()
+            root.protocol('WM_DELETE_WINDOW', closed.set)
+            last_move_time = [0.0]
+            last_control_state = [None]
+            displayed_image_size = [None]
+            blocked_gui_keys = {0x12, 0x5B, 0x5C}  # Alt、左/右 Windows 键
+
+            def control_active():
+                with remote_state_lock:
+                    return self.sip in remote_controls
+
+            def normalized_mouse(event):
+                image_size = displayed_image_size[0]
+                if image_size is None:
+                    image_size = (label.winfo_width(), label.winfo_height())
+                image_width = max(1, image_size[0] - 1)
+                image_height = max(1, image_size[1] - 1)
+                x = min(max(event.x, 0), image_width)
+                y = min(max(event.y, 0), image_height)
+                normalized_x = round(x * 65535 / image_width)
+                normalized_y = round(y * 65535 / image_height)
+                source_x = round(normalized_x * max(0, width - 1) / 65535)
+                source_y = round(normalized_y * max(0, height - 1) / 65535)
+                return normalized_x, normalized_y, source_x, source_y
+
+            def focus_control_window():
+                try:
+                    root.lift()
+                    root.focus_force()
+                    label.focus_set()
+                except tk.TclError:
+                    pass
+
+            def mouse_event(action, event, data=0):
+                if not control_active():
+                    return None
+                try:
+                    x, y, source_x, source_y = normalized_mouse(event)
+                    self.local_cursor = (source_x, source_y)
+                    self.local_cursor_version += 1
+                    self.last_local_cursor_at = time.monotonic()
+                    send_remote_mouse(self.sip, action, x, y, data)
+                    if action.endswith('down'):
+                        focus_control_window()
+                except Exception as e:
+                    logger.warning('[RemoteControl] 窗口鼠标事件失败：%s', e)
+                return 'break'
+
+            def mouse_move(event):
+                if not control_active():
+                    return None
+                now = time.monotonic()
+                if now - last_move_time[0] < 1 / 120:
+                    return 'break'
+                last_move_time[0] = now
+                return mouse_event('move', event)
+
+            def mouse_wheel(event):
+                return mouse_event('wheel', event, int(event.delta or 0))
+
+            extended_keys = {
+                'Left', 'Right', 'Up', 'Down', 'Home', 'End', 'Prior',
+                'Next', 'Insert', 'Delete', 'Control_R', 'Alt_R',
+                'KP_Enter', 'Num_Lock', 'Print', 'Cancel',
+            }
+
+            def key_event(event, key_up):
+                if not control_active():
+                    return None
+                try:
+                    virtual_key = int(event.keycode) & 0xFFFF
+                    if virtual_key in blocked_gui_keys:
+                        logger.info('[RemoteControl] 已拦截系统修饰键 vk=%#x',
+                                    virtual_key)
+                        return 'break'
+                    logger.info('[RemoteControl] 窗口按键 %s keysym=%s '
+                                'keycode=%#x',
+                                'up' if key_up else 'down', event.keysym,
+                                virtual_key)
+                    send_remote_key(self.sip, virtual_key, key_up=key_up,
+                                    extended=event.keysym in extended_keys)
+                except Exception as e:
+                    logger.warning('[RemoteControl] 窗口键盘事件失败：%s', e)
+                return 'break'
+
+            # Tk 会被 Windows 输入法吞掉部分字母键（尤其是中文输入法状态下）。
+            # 远控时安装低级键盘钩子，直接使用系统提供的 VK/扫描码/按键状态。
+            keyboard_hook_handle = [None]
+            keyboard_hook_callback = [None]
+
+            def install_keyboard_hook():
+                if os.name != 'nt' or keyboard_hook_handle[0] is not None:
+                    return
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    user32 = ctypes.windll.user32
+                    kernel32 = ctypes.windll.kernel32
+                    WH_KEYBOARD_LL = 13
+                    WM_KEYDOWN = 0x0100
+                    WM_KEYUP = 0x0101
+                    WM_SYSKEYDOWN = 0x0104
+                    WM_SYSKEYUP = 0x0105
+                    LLKHF_EXTENDED = 0x01
+                    LLKHF_INJECTED = 0x10
+
+                    class KBDLLHOOKSTRUCT(ctypes.Structure):
+                        _fields_ = [
+                            ('vkCode', wintypes.DWORD),
+                            ('scanCode', wintypes.DWORD),
+                            ('flags', wintypes.DWORD),
+                            ('time', wintypes.DWORD),
+                            ('dwExtraInfo', ctypes.c_void_p),
+                        ]
+
+                    callback_type = ctypes.WINFUNCTYPE(
+                        ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM,
+                        wintypes.LPARAM)
+
+                    def keyboard_hook_proc(code, message, lparam):
+                        try:
+                            if code >= 0 and control_active():
+                                info = ctypes.cast(
+                                    lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)
+                                ).contents
+                                if not (info.flags & LLKHF_INJECTED):
+                                    vk = int(info.vkCode) & 0xFFFF
+                                    key_up = message in (WM_KEYUP, WM_SYSKEYUP)
+                                    if vk in blocked_gui_keys:
+                                        logger.info(
+                                            '[RemoteControl] 全局钩子拦截系统键 vk=%#x',
+                                            vk)
+                                        return 1
+                                    scan = int(info.scanCode) & 0xFFFF
+                                    extended = bool(info.flags & LLKHF_EXTENDED)
+                                    logger.info(
+                                        '[RemoteControl] 全局按键 %s vk=%#x scan=%#x flags=%#x',
+                                        'up' if key_up else 'down', vk, scan,
+                                        int(info.flags))
+                                    send_remote_key(
+                                        self.sip, vk, key_up=key_up,
+                                        scan_code=(scan or None), extended=extended)
+                                    return 1
+                        except Exception as e:
+                            logger.warning('[RemoteControl] 全局键盘钩子失败：%s', e)
+                        return user32.CallNextHookEx(
+                            keyboard_hook_handle[0], code, message, lparam)
+
+                    callback = callback_type(keyboard_hook_proc)
+                    handle = user32.SetWindowsHookExW(
+                        WH_KEYBOARD_LL, callback,
+                        kernel32.GetModuleHandleW(None), 0)
+                    if not handle:
+                        raise ctypes.WinError()
+                    keyboard_hook_callback[0] = callback
+                    keyboard_hook_handle[0] = handle
+                    logger.info('[RemoteControl] Windows 全局键盘钩子已启用')
+                except Exception as e:
+                    logger.warning('[RemoteControl] Windows 全局键盘钩子不可用：%s', e)
+
+            def uninstall_keyboard_hook():
+                handle = keyboard_hook_handle[0]
+                if handle is None:
+                    return
+                try:
+                    import ctypes
+                    ctypes.windll.user32.UnhookWindowsHookEx(handle)
+                except Exception as e:
+                    logger.debug('[RemoteControl] 卸载全局键盘钩子失败：%s', e)
+                finally:
+                    keyboard_hook_handle[0] = None
+                    keyboard_hook_callback[0] = None
+
+            label.bind('<Motion>', mouse_move)
+            label.bind('<ButtonPress-1>',
+                       lambda e: mouse_event('leftdown', e))
+            label.bind('<ButtonRelease-1>',
+                       lambda e: mouse_event('leftup', e))
+            label.bind('<ButtonPress-2>',
+                       lambda e: mouse_event('middledown', e))
+            label.bind('<ButtonRelease-2>',
+                       lambda e: mouse_event('middleup', e))
+            label.bind('<ButtonPress-3>',
+                       lambda e: mouse_event('rightdown', e))
+            label.bind('<ButtonRelease-3>',
+                       lambda e: mouse_event('rightup', e))
+            label.bind('<MouseWheel>', mouse_wheel)
+            root.bind_all('<KeyPress>', lambda e: key_event(e, False))
+            root.bind_all('<KeyRelease>', lambda e: key_event(e, True))
+            root.update_idletasks()
+            root.update()
+            threading.Thread(
+                target=read_decoded_frames,
+                name=f'view-decode-{self.base_name}', daemon=True,
+            ).start()
+            waiting_since = time.monotonic()
+            warned = False
+            base_frame = None
+            displayed_cursor_version = -1
+            while (not self.stop_event.is_set() and not closed.is_set()
+                   and player is self.player):
+                try:
+                    raw_frame = frames.get_nowait()
+                except queue.Empty:
+                    raw_frame = None
+                if raw_frame is not None:
+                    base_frame = Image.frombytes('RGB', (width, height), raw_frame)
+                    waiting_since = time.monotonic()
+                current_control_state = control_active()
+                predicted_cursor_active = (
+                    current_control_state and self.local_cursor is not None
+                    and time.monotonic() - self.last_local_cursor_at < 0.18
+                )
+                cursor_version = (self.remote_cursor_version,
+                                  self.local_cursor_version,
+                                  predicted_cursor_active)
+                if (base_frame is not None
+                        and (raw_frame is not None
+                             or cursor_version != displayed_cursor_version)):
+                    frame = base_frame.copy()
+                    cursor = (self.local_cursor if predicted_cursor_active
+                              else self.remote_cursor)
+                    if cursor is not None:
+                        cursor_x = min(max(cursor[0], 0), width - 1)
+                        cursor_y = min(max(cursor[1], 0), height - 1)
+                        arm = max(8, min(width, height) // 60)
+                        draw = ImageDraw.Draw(frame)
+                        lines = [
+                            (cursor_x - arm, cursor_y, cursor_x + arm, cursor_y),
+                            (cursor_x, cursor_y - arm, cursor_x, cursor_y + arm),
+                        ]
+                        for line in lines:
+                            draw.line(line, fill='black', width=5)
+                            draw.line(line, fill='white', width=2)
+                    screen_w = max(320, root.winfo_screenwidth() - 80)
+                    screen_h = max(240, root.winfo_screenheight() - 120)
+                    resampling = getattr(Image, 'Resampling', Image)
+                    frame.thumbnail((screen_w, screen_h), resampling.LANCZOS)
+                    displayed_image_size[0] = frame.size
+                    photo = ImageTk.PhotoImage(frame)
+                    label.configure(image=photo, text='', width=0, height=0)
+                    label.image = photo
+                    displayed_cursor_version = cursor_version
+                elif (not warned and time.monotonic() - waiting_since >= 5):
+                    warned = True
+                    logger.warning('[RemoteView] FFmpeg 5 秒内未输出画面，窗口将继续等待；请查看随后 FFmpeg 日志')
+                if current_control_state != last_control_state[0]:
+                    title = ('远程控制' if current_control_state else '学生屏幕')
+                    root.title(f'{title} {self.sip}')
+                    if current_control_state:
+                        install_keyboard_hook()
+                        root.after_idle(focus_control_window)
+                    else:
+                        uninstall_keyboard_hook()
+                    last_control_state[0] = current_control_state
+                root.update_idletasks()
+                root.update()
+                if reader_done.is_set() and frames.empty():
+                    label.configure(text='视频解码器已停止，请查看日志', image='',
+                                    width=60, height=20)
+                time.sleep(0.015)
+        except Exception as e:
+            if not self.stop_event.is_set():
+                logger.warning('[RemoteView] Pillow/Tkinter 显示线程退出：%s', e)
+        finally:
+            try:
+                uninstall_keyboard_hook()
+            except UnboundLocalError:
+                pass
+            if closed.is_set():
+                self.player_unavailable = True
+                with remote_state_lock:
+                    control_was_active = self.sip in remote_controls
+                if control_was_active:
+                    try:
+                        stop_remote_control(self.sip)
+                    except OSError as e:
+                        logger.warning('[RemoteControl] 关闭窗口时停止远控失败：%s', e)
+            if player is self.player:
+                try:
+                    player.terminate()
+                except OSError:
+                    pass
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+
+    def _opencv_h264_reader(self, player, width, height):
+        frame_size = width * height * 3
+        window_name = f'学生屏幕 {self.sip}'
+        try:
+            import cv2
+            import numpy as np
+            while not self.stop_event.is_set() and player is self.player:
+                chunks = bytearray()
+                while len(chunks) < frame_size:
+                    chunk = player.stdout.read(frame_size - len(chunks))
+                    if not chunk:
+                        return
+                    chunks.extend(chunk)
+                frame = np.frombuffer(chunks, dtype=np.uint8).reshape(
+                    (height, width, 3)
+                )
+                cv2.imshow(window_name, frame)
+                cv2.waitKey(1)
+        except Exception as e:
+            if not self.stop_event.is_set():
+                logger.warning('[RemoteView] H264 显示线程退出：%s', e)
+        finally:
+            try:
+                cv2.destroyWindow(window_name)
+            except Exception:
+                pass
+
+    def _stop_player(self):
+        player, self.player = self.player, None
+        self.player_format = None
+        kind, self.player_kind = self.player_kind, None
+        self.player_size = None
+        if player is None:
+            return
+        if kind == 'opencv-jpeg':
+            try:
+                import cv2
+                cv2.destroyWindow(f'学生屏幕 {self.sip}')
+            except Exception:
+                pass
+            return
+        try:
+            if player.stdin:
+                player.stdin.close()
+        except OSError:
+            pass
+        try:
+            player.terminate()
+        except OSError:
+            pass
+
+
+def probe_remote_view(sip, port=TCP_COMM_PORT, timeout=1.5):
+    """仅探测学生端 TCP 服务是否监听；不发送 feature 8 或 SHCO。"""
+    socket.inet_aton(sip)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        probe.bind((ip, 0))
+        error = probe.connect_ex((sip, port))
+        if error == 0:
+            return True, None
+        return False, f'TCP connect_ex={error}'
+    except OSError as e:
+        return False, str(e)
+    finally:
+        probe.close()
+
+
+def start_remote_view(sip, port=TCP_COMM_PORT):
+    if not _check_student(sip, 'view <学生IP> [TCP端口]'):
+        return False
+    with remote_state_lock:
+        failure_time = remote_view_failures.get(sip)
+        if failure_time is not None:
+            remaining = VIEW_FAILURE_COOLDOWN - (time.monotonic() - failure_time)
+            if remaining > 0:
+                print(f'[观看] {sip} 仍在失败冷却中，请等待 {int(remaining) + 1} 秒；不要连续执行 view')
+                return False
+            remote_view_failures.pop(sip, None)
+        if remote_views.get(sip):
+            print(f'[观看] {sip} 已有观看会话；如需重启请先执行 view_stop {sip}')
+            return False
+    reachable, detail = probe_remote_view(sip, port)
+    if not reachable:
+        print(f'[观看] 未启动：{sip}:{port} 未监听（{detail}）。请先确认学生端已重新登录，再执行 view_probe')
+        return False
+    with remote_state_lock:
+        session = RemoteViewSession(sip, port)
+        remote_views[sip] = session
+    try:
+        send_remote_view_feature(sip, True)
+    except Exception:
+        with remote_state_lock:
+            if remote_views.get(sip) is session:
+                remote_views.pop(sip, None)
+            remote_view_failures[sip] = time.monotonic()
+        session.stop()
+        raise
+    session.start()
+    return True
+
+
+def stop_remote_view(sip, notify=True):
+    with remote_state_lock:
+        session = remote_views.pop(sip, None)
+    if session:
+        session.stop()
+    if notify:
+        send_remote_view_feature(sip, False)
+    logger.info('[RemoteView] stop -> %s（本地会话=%s）', sip, bool(session))
+
+
+def build_remote_control_payload(sip, mode, port):
+    """构造 MCMD；mode 0/2 开始远控，mode 1 停止。"""
+    payload = bytearray(53)
+    struct.pack_into('<III', payload, 0, 53, 8, 0)
+    payload[12:16] = b'MCMD'
+    struct.pack_into('<I', payload, 16, mode)
+    payload[20:24] = socket.inet_aton(sip)
+    struct.pack_into('<H', payload, 24, port)
+    return bytes(payload)
+
+
+def choose_remote_control_port():
+    """选择学生端模拟输入线程的 UDP 监听端口。"""
+    if CONTROL_PORT:
+        return CONTROL_PORT
+    return random.SystemRandom().randint(49152, 65535)
+
+
+def start_remote_control(sip, port=None):
+    if not REMOTE_CONTROL_ENABLED:
+        print('[远控] 已禁用；删除 TEACHER_ENABLE_REMOTE_CONTROL=0 后重启脚本即可启用')
+        return False
+    if not _check_student(sip, 'control <学生IP> [UDP端口]'):
+        return False
+    with remote_state_lock:
+        session = remote_views.get(sip)
+    if session is None or not session.connected_event.is_set():
+        print('[远控] 未发送 MCMD：屏幕 TCP 通道尚未连接')
+        return False
+    if port is None:
+        port = choose_remote_control_port()
+    if not 1 <= port <= 0xFFFF:
+        raise ValueError('远控 UDP 端口必须在 1..65535')
+    # mode 0 和 2 都会在学生端调用 BeginSimulate；mode 2 还会先执行
+    # 官方 control 分支的输入 Hook 初始化和本地输入锁定。
+    mode = CONTROL_MODE
+    if mode == 1:
+        raise ValueError('TEACHER_CONTROL_MODE=1 是仅观看模式，不能用于 control')
+    packet = build_command_transaction(
+        build_remote_control_payload(sip, mode, port))
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sender.bind((ip, 0))
+    with remote_state_lock:
+        old = remote_controls.pop(sip, None)
+        if old:
+            old['sock'].close()
+        remote_controls[sip] = {
+            'port': port,
+            'sock': sender,
+            'input_count': 0,
+            'ready_at': time.monotonic() + 0.35,
+        }
+    sock.sendto(packet, (sip, PORT))
+    mode_name = 'Share' if mode == 0 else 'Control Student'
+    logger.info('[RemoteControl] COMD/MCMD mode=%d (%s) -> %s:%d，输入端点=%s:%d',
+                mode, mode_name, sip, PORT, sip, port)
+    return port
+
+
+def stop_remote_control(sip, notify=True):
+    with remote_state_lock:
+        state = remote_controls.pop(sip, None)
+    port = state['port'] if state else (CONTROL_PORT or 0)
+    if state:
+        state['sock'].close()
+    if notify:
+        packet = build_command_transaction(
+            build_remote_control_payload(sip, 1, port))
+        sock.sendto(packet, (sip, PORT))
+    logger.info('[RemoteControl] stop -> %s:%d', sip, port)
+
+
+def send_remote_input(sip, kind, payload):
+    if len(payload) != 20:
+        raise ValueError('远控输入 payload 必须是 20 字节')
+    with remote_state_lock:
+        state = remote_controls.get(sip)
+    if not state:
+        print(f'[远控] {sip} 尚未 control，请先执行 control {sip}')
+        return False
+    startup_delay = state['ready_at'] - time.monotonic()
+    if startup_delay > 0:
+        time.sleep(startup_delay)
+    packet = struct.pack('<II', 0x2321347C, kind) + payload
+    state['sock'].sendto(packet, (sip, state['port']))
+    with remote_state_lock:
+        state['input_count'] += 1
+        input_count = state['input_count']
+    if kind == 16 or input_count <= 8 or input_count % 100 == 0:
+        logger.info('[RemoteControl] input #%d kind=%d -> %s:%d data=%s',
+                    input_count, kind, sip, state['port'], packet.hex(' '))
+    else:
+        logger.debug('[RemoteControl] input #%d kind=%d -> %s:%d\n%s',
+                     input_count, kind, sip, state['port'], hexdump(packet))
+    return True
+
+
+MOUSE_MESSAGES = {
+    'move': 0x0200,
+    'leftdown': 0x0201,
+    'leftup': 0x0202,
+    'rightdown': 0x0204,
+    'rightup': 0x0205,
+    'middledown': 0x0207,
+    'middleup': 0x0208,
+    'wheel': 0x020A,
+}
+
+
+def send_remote_mouse(sip, action, x, y, data=0, swapped=0):
+    action = action.lower()
+    if action not in MOUSE_MESSAGES:
+        raise ValueError('鼠标动作应为 ' + '/'.join(MOUSE_MESSAGES))
+    if not 0 <= x <= 65535 or not 0 <= y <= 65535:
+        raise ValueError('鼠标坐标必须在 0..65535')
+    payload = struct.pack('<IIIII', MOUSE_MESSAGES[action], x, y,
+                          data & 0xFFFFFFFF, swapped & 0xFFFFFFFF)
+    sent = send_remote_input(sip, 1, payload)
+    if sent and action != 'move':
+        logger.info('[RemoteControl] mouse %s -> %s (%d,%d) data=%d',
+                    action, sip, x, y, data)
+    return sent
+
+
+def send_remote_key(sip, virtual_key, key_up=False, scan_code=None,
+                    extended=False):
+    if not 0 <= virtual_key <= 0xFFFF:
+        raise ValueError('虚拟键码必须在 0..0xFFFF')
+    if scan_code is None:
+        try:
+            import ctypes
+            scan_code = ctypes.windll.user32.MapVirtualKeyW(virtual_key, 0)
+        except Exception:
+            scan_code = virtual_key
+    flags = (1 if extended else 0) | (0x80 if key_up else 0)
+    payload = struct.pack('<HHI', scan_code & 0xFFFF,
+                          virtual_key & 0xFFFF, flags) + b'\x00' * 12
+    return send_remote_input(sip, 16, payload)
 
 
 def send_chat(sip, text):
@@ -758,8 +1835,8 @@ def build_blackscreen_mess_payload(lock_input=True, timeout=10, text=None, text_
       [4..7]  = 0x20 (黑屏)
       [8..11] = 0x80000000 (启动标志)
       [12..15]= lock_input (1=锁定键鼠)
-      [16..19]= 0x01 (field_1)
-      [20..23]= timeout (超时秒数, 0=永久)
+      [16..19]= 0x01 (禁用学生端本地定时器，由教师端负责超时解锁)
+      [20..23]= timeout (超时秒数, 0=永久；供协议字段保持一致)
       [24..27]= has_text (0/1)
       [28..31]= text_color (Windows COLORREF: 0x00BBGGRR)
       [32..35]= 0x00000000 (field_5)
@@ -780,7 +1857,7 @@ def build_blackscreen_mess_payload(lock_input=True, timeout=10, text=None, text_
     payload += struct.pack('<I', 0x20)                    # [4] 黑屏
     payload += struct.pack('<I', 0x80000000)              # [8] 启动标志
     payload += struct.pack('<I', 1 if lock_input else 0)  # [12] 锁定输入
-    payload += struct.pack('<I', 1)                       # [16] field_1=1
+    payload += struct.pack('<I', 1)                       # [16] 不启用学生端本地定时器
     payload += struct.pack('<I', timeout)                 # [20] 超时
     payload += struct.pack('<I', has_text)                # [24] 有自定义文字
     payload += struct.pack('<I', text_color)              # [28] 文字颜色 (0x00BBGGRR)
@@ -796,30 +1873,34 @@ def build_blackscreen_mess_payload(lock_input=True, timeout=10, text=None, text_
 blackscreen_timers = {}   # sip -> threading.Timer
 
 
-def _send_comd_lock(sip, lock=True):
-    """通过 COMD 路径锁定/解锁键鼠（sub_44A490 case 6）。
+def _send_comd_blackscreen_lock(sip, timeout=10):
+    """补发 COMD case 6 黑屏锁定命令，兼容只处理该路径的学生端。
 
-    MESS 黑屏包负责显示黑屏窗口，COMD case 6 负责实际锁定键鼠。
-    真实教师端两条路径都会发。
+    学生端反编译确认：case 6 的 lock_input=0 仅表示“不新加锁”，并
+    不是解锁命令。这里因此只发送 lock_input=1。timer_flag=1 禁用
+    学生端本地定时器，统一由 blackscreen_timers 负责超时解锁，避免
+    永久黑屏被 COMD 中固定的 10 秒定时器提前解除。
     """
     payload = struct.pack('<I', 0x200)        # subcmd
     payload += struct.pack('<I', 0)            # flags
     payload += struct.pack('<I', 6)            # case 6 = 黑屏/锁键鼠
-    payload += struct.pack('<I', 1 if lock else 0)  # lock_input
-    payload += struct.pack('<I', 0)            # timer_flag
-    payload += struct.pack('<I', 10)           # timeout
+    payload += struct.pack('<I', 1)            # lock_input=1
+    payload += struct.pack('<I', 1)            # 禁用学生端本地定时器
+    payload += struct.pack('<I', timeout)       # 与 MESS timeout 保持一致
     payload += struct.pack('<I', 0)            # has_text
     payload += b'\x00' * 8                    # padding
     pkt = build_comd_command_ex(0x80000010, payload, 'f96a6d195b2946b9ab958a143ecddc26')
     sock.sendto(pkt, (sip, PORT))
-    logger.info('[锁键鼠] COMD case6 lock=%s -> %s:%d', lock, sip, PORT)
+    logger.info('[锁键鼠] COMD case6 lock=1 timer_flag=1 timeout=%d -> %s:%d',
+                timeout, sip, PORT)
 
 
 def send_blackscreen(sip, lock_input=True, timeout=10, text=None):
     """向已登录学生发送黑屏安静命令。
 
-    MESS 协议 → 当前频道对应的会话组播端点（黑屏窗口 + bit 0x20 状态）
-    COMD 协议 → 学生单播 :4705（锁定键鼠，sub_44A490 case 6）
+    MESS 协议 → 当前频道对应的会话组播端点（黑屏窗口、bit 0x20 状态，
+                  lock_input 非零时也会直接锁定键鼠）
+    COMD 协议 → 学生单播 :4705（锁定兼容补包，sub_44A490 case 6）
 
     超时由教师端主动发解锁包实现——先发 flags=0x80000000（锁），
     时间到再发 flags=0x90000000（解）。
@@ -828,7 +1909,7 @@ def send_blackscreen(sip, lock_input=True, timeout=10, text=None):
         print(f'[命令] 学生 {sip} 未登录')
         return
     try:
-        # 1) MESS 黑屏包 → 组播（创建黑屏窗口 + 设置 bit 0x20）
+        # 1) MESS 黑屏包 → 组播（创建窗口、设置 bit 0x20，并按 lock_input 锁键鼠）
         payload = build_blackscreen_mess_payload(lock_input, timeout, text)
         mess = (struct.pack('<II', 0x5353454D, 1)
                 + struct.pack('<I', 1)
@@ -836,9 +1917,9 @@ def send_blackscreen(sip, lock_input=True, timeout=10, text=None):
                 + payload)
         sock2.sendto(mess, (SMCAST, SPORT))
 
-        # 2) COMD 锁键鼠 → 单播（实际锁定键盘和鼠标）
+        # 2) COMD case 6 → 单播兼容补包；不启用学生端本地定时器
         if lock_input:
-            _send_comd_lock(sip, lock=True)
+            _send_comd_blackscreen_lock(sip, timeout=timeout)
 
         # 取消之前的定时器
         if sip in blackscreen_timers:
@@ -875,7 +1956,7 @@ def _auto_unlock(sip):
 
 
 def _do_unlock(sip):
-    """同时通过 MESS + COMD 两条路径解锁。"""
+    """通过 MESS 停止标志关闭黑屏并解除键鼠锁。"""
     try:
         # MESS 解锁 → 组播（flags=0x90000000，清除 bit 0x20）
         payload = (struct.pack('<I', 0x0D)
@@ -888,15 +1969,12 @@ def _do_unlock(sip):
                 + payload)
         sock2.sendto(mess, (SMCAST, SPORT))
         logger.info('[解锁] MESS -> %s:%d 目标=%s', SMCAST, SPORT, sip)
-
-        # COMD 解锁 → 单播（lock_input=0，解除键鼠锁）
-        _send_comd_lock(sip, lock=False)
     except Exception as e:
         logger.error('[解锁] 发送失败：%s', e, exc_info=True)
 
 
 def send_unlock(sip):
-    """向已登录学生发送解锁命令（MESS + COMD 双路径）。"""
+    """向已登录学生发送 MESS 黑屏停止/解锁命令。"""
     if sip not in students:
         print(f'[命令] 学生 {sip} 未登录')
         return
@@ -956,15 +2034,32 @@ def build_dmoc():
     return struct.pack('<II', 0x434F4D44, 0x10000) + struct.pack('<I', len(dd)) + cg + dd
 
 
-def build_lpnt_subtype3():
-    """构造 LPNT subtype=3 包。"""
+def build_lpnt(policy_version=3, enabled=True, width=80, height=60, refresh_seconds=5):
+    """构造缩略图策略包：版本、启用标志、宽、高、刷新秒数。"""
     lg = bytes.fromhex('aa3a8dbe2b906645908ea29526218540')
-    return struct.pack('<II', 0x544E504C, 0x10000) + struct.pack('<I', 20) + lg + b'\x03\x00\x00\x00\x01\x00\x00\x00\x50\x00\x00\x00\x3c\x00\x00\x00\x05\x00\x00\x00'
+    policy = struct.pack('<IIIII', policy_version, int(enabled),
+                         width, height, refresh_seconds)
+    return struct.pack('<III', 0x544E504C, 0x10000, len(policy)) + lg + policy
+
+
+def build_srnt(frame_seq, complete=True, missing_parts=()):
+    """构造学生端实际接收的 SRNT 帧确认/重传请求。"""
+    lg = bytes.fromhex('aa3a8dbe2b906645908ea29526218540')
+    if missing_parts is None:
+        payload = struct.pack('<III', frame_seq, 0, 0xFFFFFFFF)
+    else:
+        missing_parts = tuple(missing_parts)
+        payload = struct.pack('<III', frame_seq, int(complete), len(missing_parts))
+        if missing_parts:
+            payload += struct.pack(f'<{len(missing_parts)}H', *missing_parts)
+    # DLL 要求 payload 至少 14 字节；最后两个字节不参与解析。
+    payload += b'\x00\x00'
+    return struct.pack('<III', 0x544E5253, 0x10000, len(payload)) + lg + payload
 
 
 def keep_alive_preview(sip):
-    """学生登录后周期性发送 LPNT subtype=3 + DMOC，直到收到预览或学生下线。"""
-    lp = build_lpnt_subtype3()
+    """学生登录后周期性发送启用的 LPNT + DMOC，直到开始收到预览。"""
+    lp = build_lpnt(3, True)
     dm = build_dmoc()
     logger.info('[KeepAlive] 启动 %s', sip)
     while running and sip in students:
@@ -988,13 +2083,14 @@ def keep_alive_preview(sip):
 
 def handle_tnal(d, sip):
     """接收 LANT 预览缩略图片段并拼成 JPEG。"""
-    logger.debug('[TNAL] RECV from %s, len=%d\n%s', sip, len(d), hexdump(d[:256]))
+    logger.debug('[LANT] RECV from %s, len=%d\n%s', sip, len(d), hexdump(d[:256]))
 
     if len(d) < 48:
         logger.warning('[TNAL] 包太短：%d 字节 from %s', len(d), sip)
         return
 
     try:
+        frame_seq = struct.unpack('<I', d[32:36])[0]
         total = struct.unpack('<I', d[36:40])[0]
         offset = struct.unpack('<I', d[40:44])[0]
         frag_len = struct.unpack('<I', d[44:48])[0]
@@ -1003,27 +2099,38 @@ def handle_tnal(d, sip):
         return
 
     frag = d[48:48+frag_len]
-    logger.debug('[TNAL] %s total=%d offset=%d frag_len=%d', sip, total, offset, frag_len)
+    logger.debug('[LANT] %s frame=%d total=%d offset=%d frag_len=%d',
+                 sip, frame_seq, total, offset, frag_len)
 
-    if not frag or total == 0:
-        logger.warning('[TNAL] 空片段或 total==0 from %s', sip)
+    if not frag or total == 0 or offset >= total:
+        logger.warning('[LANT] 非法片段 frame=%d total=%d offset=%d from %s',
+                       frame_seq, total, offset, sip)
         return
 
     state = previews.get(sip)
-    if state is None or state['total'] != total or offset == 0:
-        logger.info('[TNAL] %s 新建/重置 previews，total=%d', sip, total)
-        state = {'total': total, 'buf': bytearray(total), 'got': 0}
+    if state is None or state['frame_seq'] != frame_seq or state['total'] != total:
+        logger.info('[LANT] %s 新建帧 frame=%d total=%d', sip, frame_seq, total)
+        state = {
+            'frame_seq': frame_seq,
+            'total': total,
+            'buf': bytearray(total),
+            'got': 0,
+            'received': {},
+        }
         previews[sip] = state
 
     end = min(offset + len(frag), total)
     written = end - offset
     if written <= 0:
-        logger.warning('[TNAL] 非法写入 offset=%d end=%d from %s', offset, end, sip)
+        logger.warning('[LANT] 非法写入 offset=%d end=%d from %s', offset, end, sip)
         return
 
     state['buf'][offset:end] = frag[:written]
-    state['got'] += written
-    logger.debug('[TNAL] %s 进度 %d/%d (+%d)', sip, state['got'], total, written)
+    previous = state['received'].get(offset, 0)
+    state['received'][offset] = max(previous, written)
+    state['got'] += max(0, written - previous)
+    logger.debug('[LANT] %s frame=%d 进度 %d/%d (+%d)',
+                 sip, frame_seq, state['got'], total, max(0, written - previous))
 
     if state['got'] >= total:
         idx = 0
@@ -1058,6 +2165,7 @@ def handle_tnal(d, sip):
             logger.error('[Preview] 修复图保存失败：%s', e, exc_info=True)
 
         logger.info('[Preview] %s 接收完成', sip)
+        completed_preview_frames[sip] = frame_seq
         del previews[sip]
 
 
@@ -1280,10 +2388,10 @@ def build_session_reply(recipient_ip, msg_type):
         payload = struct.pack('<III', 0x0D, 0x1000, 0)
         payload += b'\x00'
     elif msg_type == 0x8000:
-        # 默认 TCPMode=0、TcpComPort=4806，与教师端默认配置一致。
+        # 连续桌面观看需要 TCPMode=1；均可通过环境变量覆盖。
         # 尾部状态值来自已验证样本；总长度严格保持 0x1B。
         payload = struct.pack('<III', 0x1B, 0x8000, 0)
-        payload += struct.pack('<IH', 0, 4806)
+        payload += struct.pack('<IH', TCP_COMM_MODE, TCP_COMM_PORT)
         payload += b'\x00' * 4
         payload += struct.pack('<I', 0x270034B0)
         payload += b'\x00'
@@ -1421,7 +2529,7 @@ def main_recv():
 
             elif mag == 0x434D5254:  # TRMC
                 logger.debug('[MainRecv] TRMC %s -> LPNT+DMOC', sip)
-                lp = build_lpnt_subtype3()
+                lp = build_lpnt(3, True)
                 dm = build_dmoc()
                 sock.sendto(lp, (sip, PORT))
                 time.sleep(0.05)
@@ -1431,9 +2539,26 @@ def main_recv():
                 logger.debug('[MainRecv] TRNT %s 学生准备好预览', sip)
 
             elif mag == 0x544E4544:  # DENT
-                logger.info('[MainRecv] DENT %s -> TNRS', sip)
-                tg = bytes.fromhex('aa3a8dbe2b906645908ea29526218540')
-                pkt = struct.pack('<II', 0x544E5253, 0x10000) + struct.pack('<I', 14) + tg + b'\x06\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x09\x00'
+                if len(d) < 40:
+                    logger.warning('[MainRecv] DENT 包过短：%d from %s', len(d), sip)
+                    continue
+                frame_seq = struct.unpack('<I', d[36:40])[0]
+                state = previews.get(sip)
+                if state and state['frame_seq'] == frame_seq:
+                    part_count = (state['total'] + 1023) // 1024
+                    missing = [index for index in range(part_count)
+                               if index * 1024 not in state['received']]
+                    pkt = build_srnt(frame_seq, complete=not missing,
+                                     missing_parts=missing)
+                    action = 'complete' if not missing else f'retry {len(missing)} parts'
+                elif completed_preview_frames.get(sip) == frame_seq:
+                    pkt = build_srnt(frame_seq, complete=True)
+                    action = 'complete'
+                else:
+                    pkt = build_srnt(frame_seq, complete=False, missing_parts=None)
+                    action = 'retry all'
+                logger.info('[MainRecv] DENT %s frame=%d -> SRNT %s',
+                            sip, frame_seq, action)
                 sock.sendto(pkt, (sip, PORT))
 
             elif mag == 0x544E414C:  # LANT
@@ -1499,6 +2624,13 @@ def cmd_help():
   help / ?              显示帮助
   list / ls             列出已登录学生
   preview <ip>          请求指定学生的屏幕预览
+  view_probe <ip> [port]  仅探测学生 TCP 观看端口，不发送观看请求
+  view <ip> [port]      连续观看学生屏幕（V6 TCP/UMSP，默认 4806）
+  view_stop <ip>        停止连续观看
+  control <ip> [port]   打开交互式远程控制窗口（默认随机高位 UDP 端口）
+  control_stop <ip>     停止远程控制
+  mouse <ip> <动作> <x> <y> [data]  发送鼠标事件，坐标范围 0..65535
+  key <ip> <vk> [press|down|up] [scan] [extended]  发送键盘事件
   all                   请求所有学生的屏幕预览
   msg <ip> <text>       向指定学生发送聊天消息
   info <ip> [0|1|2]     请求学生上报信息（0=全部 1=窗口列表 2=进程列表，登录后自动请求一次）
@@ -1522,6 +2654,11 @@ def cmd_help():
     bs 192.168.2.139              黑屏 + 锁键鼠，10秒自动解
     bs 192.168.2.139 0            只黑屏不锁键鼠
     bs 192.168.2.139 1 请认真听课  黑屏锁键鼠 + 自定义文字
+    view_probe 192.168.2.139     先确认学生观看端口已监听
+    view 192.168.2.139           打开连续屏幕观看窗口
+    control 192.168.2.139        打开窗口并开始鼠标/键盘远控
+    mouse 192.168.2.139 move 32768 32768
+    key 192.168.2.139 0x41 press  按一次 A 键
     shutdown 192.168.2.139        立即强制关机
     reboot 192.168.2.139 30 请保存作业  倒计时30秒重启并显示提示文字''')
 
@@ -1710,6 +2847,119 @@ def cmd_preview(args):
     print(f'[命令] 已向 {sip} 请求预览')
 
 
+def cmd_view(args):
+    if not args:
+        print('[命令] 用法：view <学生IP> [TCP端口]')
+        return
+    sip = args[0]
+    try:
+        port = int(args[1].strip(), 0) if len(args) > 1 else TCP_COMM_PORT
+        if not 1 <= port <= 0xFFFF:
+            raise ValueError('端口必须在 1..65535')
+        if start_remote_view(sip, port):
+            print(f'[观看] 已启动 {sip}:{port}，正在连接；画面由 ffplay 显示')
+    except ValueError as e:
+        print(f'[观看] 参数错误：{e}')
+    except OSError as e:
+        print(f'[观看] 启动失败：{e}')
+
+
+def cmd_view_probe(args):
+    if not args:
+        print('[命令] 用法：view_probe <学生IP> [TCP端口]')
+        return
+    sip = args[0]
+    try:
+        port = int(args[1].strip(), 0) if len(args) > 1 else TCP_COMM_PORT
+        if not 1 <= port <= 0xFFFF:
+            raise ValueError('端口必须在 1..65535')
+        if not _check_student(sip, 'view_probe <学生IP> [TCP端口]'):
+            return
+        reachable, detail = probe_remote_view(sip, port)
+        if reachable:
+            print(f'[观看] 探测成功：{sip}:{port} 正在监听，可以执行 view {sip}')
+        else:
+            print(f'[观看] 探测失败：{sip}:{port} 未监听（{detail}）；未发送观看请求')
+    except (ValueError, OSError) as e:
+        print(f'[观看] 探测参数错误：{e}')
+
+
+def cmd_control(args):
+    if not args:
+        print('[命令] 用法：control <学生IP> [UDP端口]')
+        return
+    sip = args[0]
+    try:
+        port = int(args[1].strip(), 0) if len(args) > 1 else None
+        if port is not None and not 1 <= port <= 0xFFFF:
+            raise ValueError('端口必须在 1..65535')
+        if not _check_student(sip, 'control <学生IP> [UDP端口]'):
+            return
+        with remote_state_lock:
+            session = remote_views.get(sip)
+        if session is None:
+            if not start_remote_view(sip):
+                print('[远控] 未发送 MCMD：观看通道尚未建立，避免学生端进入不完整的远控状态')
+                return
+            with remote_state_lock:
+                session = remote_views.get(sip)
+        if session is not None:
+            session.enable_interactive_player()
+        if session is None or not session.connected_event.wait(6.0):
+            print('[远控] 未发送 MCMD：等待屏幕 TCP 通道超时，请先执行 view_probe 后重试')
+            return
+        selected_port = start_remote_control(sip, port)
+        if selected_port:
+            print(f'[远控] {sip}:{selected_port} 已启动；在远程控制窗口内可直接操作鼠标和键盘')
+    except (ValueError, OSError) as e:
+        print(f'[远控] 启动失败：{e}')
+
+
+def cmd_mouse(args):
+    if len(args) < 2:
+        print('[命令] 用法：mouse <学生IP> <动作> <x> <y> [data]')
+        return
+    sip = args[0]
+    parts = args[1].split()
+    if len(parts) < 3:
+        print('[命令] 用法：mouse <学生IP> <动作> <x> <y> [data]')
+        return
+    try:
+        action = parts[0]
+        x, y = int(parts[1], 0), int(parts[2], 0)
+        data = int(parts[3], 0) if len(parts) > 3 else 0
+        if send_remote_mouse(sip, action, x, y, data):
+            print(f'[远控] mouse {action} -> {sip} ({x},{y})')
+    except (ValueError, OSError) as e:
+        print(f'[远控] 鼠标事件失败：{e}')
+
+
+def cmd_key(args):
+    if len(args) < 2:
+        print('[命令] 用法：key <学生IP> <vk> [press|down|up] [scan] [extended=0|1]')
+        return
+    sip = args[0]
+    parts = args[1].split()
+    try:
+        virtual_key = int(parts[0], 0)
+        action = parts[1].lower() if len(parts) > 1 else 'press'
+        if action not in ('press', 'down', 'up'):
+            raise ValueError('动作必须是 press/down/up')
+        scan_code = int(parts[2], 0) if len(parts) > 2 else None
+        extended = bool(int(parts[3], 0)) if len(parts) > 3 else False
+        if action in ('press', 'down'):
+            if not send_remote_key(sip, virtual_key, False, scan_code, extended):
+                return
+        if action == 'press':
+            time.sleep(0.03)
+        if action in ('press', 'up'):
+            if not send_remote_key(sip, virtual_key, True, scan_code, extended):
+                return
+        print(f'[远控] key vk=0x{virtual_key:02X} {action} -> {sip}')
+    except (ValueError, OSError) as e:
+        print(f'[远控] 键盘事件失败：{e}')
+
+
 def cmd_all():
     if not students:
         print('[命令] 当前无学生登录')
@@ -1754,6 +3004,28 @@ def command_loop():
             cmd_list()
         elif cmd == 'preview':
             cmd_preview(args)
+        elif cmd == 'view_probe':
+            cmd_view_probe(args)
+        elif cmd in ('view', 'watch'):
+            cmd_view(args)
+        elif cmd in ('view_stop', 'unview'):
+            if not args:
+                print('[命令] 用法：view_stop <学生IP>')
+            else:
+                stop_remote_view(args[0])
+                print(f'[观看] 已停止 {args[0]}')
+        elif cmd in ('control', 'ctrl'):
+            cmd_control(args)
+        elif cmd in ('control_stop', 'ctrl_stop'):
+            if not args:
+                print('[命令] 用法：control_stop <学生IP>')
+            else:
+                stop_remote_control(args[0])
+                print(f'[远控] 已停止 {args[0]}')
+        elif cmd == 'mouse':
+            cmd_mouse(args)
+        elif cmd == 'key':
+            cmd_key(args)
         elif cmd == 'all':
             cmd_all()
         elif cmd == 'debug':
@@ -1851,4 +3123,8 @@ threading.Thread(target=main_recv, name='main_recv', daemon=True).start()
 command_loop()
 
 running = False
+for sip in list(remote_views):
+    stop_remote_view(sip, notify=False)
+for sip in list(remote_controls):
+    stop_remote_control(sip, notify=False)
 logger.info('程序退出。students=%s, previews=%s', list(students.keys()), list(previews.keys()))

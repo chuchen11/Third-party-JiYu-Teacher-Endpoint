@@ -3,20 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Third-party JiYu Teacher Endpoint</title>
+    <title>第三方极域教师端 - 2026.07.31 研究预览版</title>
     <meta
       name="description"
-      content="第三方极域教师端模拟器：基于逆向工程还原极域 V6.0 协议，支持黑屏锁屏、远程开关机、学生信息建档、进程/窗口列表、缩略图接收与聊天消息。"
+      content="第三方极域教师端模拟器 2026.07.31 研究预览版：基于 IDA 与抓包证据还原极域 V6.0 协议，支持连续屏幕观看、远程鼠标和实验性键盘输入。"
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="#top" aria-label="Third-party JiYu Teacher Endpoint">
+      <a class="brand" href="#top" aria-label="第三方极域教师端首页">
         <span class="brand-mark">JY</span>
         <span>Teacher Endpoint</span>
       </a>
       <nav class="nav" aria-label="页面导航">
+        <a href="#release">版本</a>
         <a href="#features">能力</a>
         <a href="#protocol">协议</a>
         <a href="#run">运行</a>
@@ -29,18 +30,22 @@
         <canvas id="packetCanvas" aria-hidden="true"></canvas>
         <div class="hero-grid">
           <div class="hero-copy">
-            <p class="eyebrow">JiYu V6.0 / UDP Protocol Lab</p>
+            <p class="eyebrow">2026.07.31 Research Preview</p>
             <h1>第三方极域教师端模拟器</h1>
             <p class="lede">
-              基于 IDA Pro 静态逆向与真实抓包复现教师端全功能通信流程：发现、登录、保活、黑屏锁屏、远程开关机、学生信息建档、聊天消息与缩略图分片——让极域 V6.0 协议成为可观察、可研究、可验证的工程样本。
+              基于 IDA Pro 静态逆向与真实抓包，还原极域 V6.0 的发现、控制和屏幕传输链路。当前版本加入连续屏幕观看与远程鼠标，键盘输入仍处于兼容性验证阶段。
             </p>
             <div class="hero-actions" aria-label="主要操作">
-              <a class="button primary" href="#run">开始运行</a>
-              <a class="button ghost" href="#protocol">查看协议</a>
+              <a class="button primary" href="#run">本地运行</a>
+              <a
+                class="button ghost"
+                href="https://github.com/yunsjxh/Third-party-JiYu-Teacher-Endpoint"
+                rel="noreferrer"
+              >GitHub 源码</a>
             </div>
           </div>
 
-          <aside class="console-panel" aria-label="模拟控制台">
+          <aside class="console-panel" aria-label="协议运行日志示例">
             <div class="console-head">
               <span class="dot red"></span>
               <span class="dot amber"></span>
@@ -48,13 +53,13 @@
               <span class="console-title">teacher_sim.log</span>
             </div>
             <div class="console-lines" id="consoleLines">
-              <p><span>08:33:13</span> Teacher 192.168.2.203 started</p>
-              <p><span>08:33:17</span> [Login] 192.168.2.139 登录成功</p>
-              <p><span>08:33:18</span> [学生信息] 计算机名=DESKTOP-SCRC6OB MAC=00-0C-29-0F-AB-ED</p>
-              <p><span>08:33:25</span> [黑屏安静] -> 192.168.2.139, lock=1, timeout=10秒</p>
-              <p><span>08:33:35</span> [AutoUnlock] 超时自动解锁 192.168.2.139</p>
-              <p><span>08:33:42</span> [Preview] preview_192_168_2_139_0_fixed.jpg</p>
-              <p><span>08:34:10</span> [命令] 已向 192.168.2.139 发送倒计时30秒重启</p>
+              <p><span>14:22:06</span> [Login] 192.168.2.139 登录成功</p>
+              <p><span>14:22:18</span> [RemoteView] TCP connected 192.168.2.139:4806</p>
+              <p><span>14:22:18</span> [RemoteView] SHCO channel=10</p>
+              <p><span>14:22:19</span> [RemoteView] HHRF H.264 frame decoded</p>
+              <p><span>14:22:23</span> [RemoteControl] MCMD mode=2 ready</p>
+              <p><span>14:22:24</span> [RemoteControl] mouse packet sent</p>
+              <p><span>14:22:28</span> [RemoteControl] kind=16 sent (experimental)</p>
             </div>
           </aside>
         </div>
@@ -62,81 +67,95 @@
 
       <section class="stats-band" aria-label="项目摘要">
         <div>
-          <strong>2</strong>
-          <span>多播通道</span>
+          <strong>4806</strong>
+          <span>TCP 屏幕通道</span>
         </div>
         <div>
-          <strong>16+</strong>
-          <span>已识别包类型</span>
+          <strong>10</strong>
+          <span>UMSP 桌面频道</span>
+        </div>
+        <div>
+          <strong>28 B</strong>
+          <span>远控输入包</span>
         </div>
         <div>
           <strong>V6.0</strong>
           <span>协议目标版本</span>
         </div>
-        <div>
-          <strong>20+</strong>
-          <span>交互命令</span>
+      </section>
+
+      <section class="section release-section" id="release">
+        <div class="section-intro narrow">
+          <p class="eyebrow">Release Status</p>
+          <h2>2026.07.31 研究预览版</h2>
+          <p>状态只代表当前测试环境中的证据，不把已发包等同于学生端已执行。</p>
+        </div>
+        <div class="release-status" aria-label="版本功能状态">
+          <div>
+            <strong class="status stable">已验证</strong>
+            <p>发现、登录、保活、聊天、缩略图、黑屏、开关机、信息与进程管理</p>
+          </div>
+          <div>
+            <strong class="status available">可用</strong>
+            <p>4806/TCP 连续观看、H.264/JPEG 解封装、U/V 色度修正、SPUC 光标解析</p>
+          </div>
+          <div>
+            <strong class="status partial">部分验证</strong>
+            <p>MCMD mode=2 远程控制，鼠标移动与点击已在当前环境验证</p>
+          </div>
+          <div>
+            <strong class="status experimental">实验性</strong>
+            <p>键盘捕获和 kind=16 发包已验证，学生端实际输入效果仍不稳定</p>
+          </div>
         </div>
       </section>
 
       <section class="section split" id="features">
         <div class="section-intro">
           <p class="eyebrow">Core Capabilities</p>
-          <h2>把黑盒通信拆成清晰的工程链路</h2>
-          <p>
-            项目聚焦协议学习与教学演示，覆盖发现、登录、保活、消息、缩略图重组与图像修正等关键路径。
-          </p>
+          <h2>从会话建立到画面与输入</h2>
+          <p>协议实现保留关键字段、传输层级与运行日志，便于对照 IDA 代码和真实报文复核。</p>
         </div>
         <div class="feature-grid">
           <article class="feature-card">
             <span class="icon">01</span>
-            <h3>在线宣告</h3>
-            <p>周期性发送 OONC、CANC、ANNO，让学生端在同一广播域内发现模拟教师机。</p>
+            <h3>发现与登录</h3>
+            <p>发送 OONC、CANC、ANNO，并处理 LOGI、KACA、TRMC、DENT 等握手与保活报文。</p>
           </article>
           <article class="feature-card">
             <span class="icon">02</span>
-            <h3>登录握手</h3>
-            <p>处理 LOGI 并回送 MESS、LPNT、DMOC，复现教师端建立连接的关键时序。</p>
+            <h3>连续屏幕观看</h3>
+            <p>连接 4806/TCP，以 SHCO 选择 UMSP channel 10，解析 TKPC、HHRF/HJRF 和桌面分片。</p>
           </article>
           <article class="feature-card">
             <span class="icon">03</span>
-            <h3>黑屏锁屏</h3>
-            <p>MESS type=0x20 + COMD case 6 双路径实现黑屏安静、键鼠锁定与自动解锁，完整复现教师端控制流程。</p>
+            <h3>画面还原</h3>
+            <p>使用 bundled FFmpeg 解码 H.264，通过 Pillow/Tk 内嵌显示，并修正学生端交换的 U/V 色度。</p>
           </article>
           <article class="feature-card">
             <span class="icon">04</span>
-            <h3>缩略图重组</h3>
-            <p>接收 LANT/TNAL 分片，拼接 JPEG，并修复 bottom-up DIB 与色度反相问题。</p>
+            <h3>远程鼠标</h3>
+            <p>用 COMD 承载 MCMD mode=2，发送 28 字节 UDP 输入包，并结合 SPUC 记录校准远端指针。</p>
           </article>
-          <article class="feature-card">
+          <article class="feature-card experimental-card">
             <span class="icon">05</span>
-            <h3>信息建档</h3>
-            <p>MESS 0x100000 信息请求，解析计算机名、用户、MAC、OS、CPU、内存及进程/窗口列表。</p>
+            <h3>实验性键盘</h3>
+            <p>已实现低级键盘 Hook、VK/扫描码采集和 kind=16 发包；学生端执行效果尚未稳定验证。</p>
           </article>
           <article class="feature-card">
             <span class="icon">06</span>
-            <h3>聊天消息</h3>
-            <p>通过 MESS 协议向指定学生发送 UTF-16LE 聊天消息，学生端弹窗显示。</p>
+            <h3>黑屏与输入锁定</h3>
+            <p>MESS type=0x20 管理黑屏状态，COMD case 6 管理键鼠锁定，并支持定时或手动解锁。</p>
           </article>
           <article class="feature-card">
             <span class="icon">07</span>
-            <h3>远程开关机</h3>
-            <p>COMD 应用命令 cmdId 0x14/0x13 调用学生端 Shutdown.exe，支持强制立即与倒计时提示两种模式。</p>
+            <h3>学生信息与进程</h3>
+            <p>请求并重组系统信息、进程和窗口列表，支持结束进程、关闭窗口与刷新验证。</p>
           </article>
           <article class="feature-card">
             <span class="icon">08</span>
-            <h3>消息解析</h3>
-            <p>按 category 路由解析学生端聊天、窗口标题、WiFi 数量、浏览器 URL 与系统性能状态。</p>
-          </article>
-          <article class="feature-card">
-            <span class="icon">09</span>
-            <h3>进程管理</h3>
-            <p>type 6/7 分片重组窗口与进程列表，按 pid/名称结束进程、按句柄/标题结束应用程序。</p>
-          </article>
-          <article class="feature-card">
-            <span class="icon">10</span>
-            <h3>远程运行</h3>
-            <p>cmdId 0x0F 远程启动程序（CreateProcess），cmdId 0x18 打开网页或文件（ShellExecute）。</p>
+            <h3>应用命令</h3>
+            <p>支持聊天、打开网页、远程运行以及带强制或倒计时模式的关机和重启命令。</p>
           </article>
         </div>
       </section>
@@ -144,53 +163,54 @@
       <section class="section flow-section" id="protocol">
         <div class="section-intro narrow">
           <p class="eyebrow">Protocol Map</p>
-          <h2>从广播发现到数据回流</h2>
+          <h2>控制、画面与输入使用不同通道</h2>
+          <p>连续观看先经 UDP 会话触发，再连接学生端 TCP 服务；远控输入则由 MCMD 建立单独的 UDP 接收端点。</p>
         </div>
         <div class="flow">
           <div class="node teacher">Teacher</div>
           <div class="lane">
-            <span>OONC / CANC / ANNO</span>
+            <span>UDP 4705 / 5512 · OONC, LOGI, MESS, COMD</span>
             <i></i>
-            <span>LOGI / KACA / MESS</span>
+            <span>TCP 4806 · SHCO → TKPC → HHRF / HJRF</span>
             <i></i>
-            <span>MESS type=0x20 + COMD case 6</span>
+            <span>COMD transaction · MCMD mode=2</span>
             <i></i>
-            <span>LANT / TNAL Preview</span>
+            <span>UDP input · 28-byte mouse / kind=16 keyboard</span>
           </div>
           <div class="node student">Student</div>
         </div>
         <div class="protocol-table" role="table" aria-label="协议包速览">
           <div role="row">
-            <span role="cell">224.50.50.42:4705</span>
-            <span role="cell">控制、缩略图、COMD 应用命令（键鼠锁、开关机）</span>
+            <span role="cell">224.50.50.42:4705/UDP</span>
+            <span role="cell">主控制、缩略图与 COMD 应用命令通道</span>
           </div>
           <div role="row">
-            <span role="cell">225.2.2.1:5512</span>
-            <span role="cell">登录宣告、MESS 黑屏控制、状态广播、信息上报</span>
+            <span role="cell">225.2.2.1:5512/UDP</span>
+            <span role="cell">登录宣告、MESS 控制、状态广播与信息上报</span>
+          </div>
+          <div role="row">
+            <span role="cell">学生端 4806/TCP</span>
+            <span role="cell">连续观看服务；SHCO 选择 UMSP channel 10</span>
+          </div>
+          <div role="row">
+            <span role="cell">TKPC / HHRF / HJRF</span>
+            <span role="cell">桌面分片外层与 H.264 / JPEG 画面记录</span>
+          </div>
+          <div role="row">
+            <span role="cell">COMD → MCMD</span>
+            <span role="cell">事务命令启动远程输入接收器，默认 Control Student mode=2</span>
+          </div>
+          <div role="row">
+            <span role="cell">28-byte UDP input</span>
+            <span role="cell">鼠标事件已验证；kind=16 键盘事件仍为实验性</span>
+          </div>
+          <div role="row">
+            <span role="cell">SPUC</span>
+            <span role="cell">学生端光标位置记录，用于校准投屏窗口中的远端指针</span>
           </div>
           <div role="row">
             <span role="cell">MESS type 0x20</span>
-            <span role="cell">黑屏安静（flags=0x80000000 锁 / 0x90000000 解）</span>
-          </div>
-          <div role="row">
-            <span role="cell">MESS type 0x100000</span>
-            <span role="cell">信息上报请求（type 5 系统信息 / 6 窗口 / 7 进程）</span>
-          </div>
-          <div role="row">
-            <span role="cell">COMD cmdId 0x14 / 0x13</span>
-            <span role="cell">关机 / 重启（|0x10000000 强制，Shutdown.exe -f -b|-nb）</span>
-          </div>
-          <div role="row">
-            <span role="cell">COMD cmdId 0x0F / 0x18</span>
-            <span role="cell">远程运行程序 / 打开网页（CreateProcess / ShellExecute）</span>
-          </div>
-          <div role="row">
-            <span role="cell">MESS type 3 / 4</span>
-            <span role="cell">结束应用程序 / 结束进程（hwnd / pid，force 强杀）</span>
-          </div>
-          <div role="row">
-            <span role="cell">COMD subcmd 0x200</span>
-            <span role="cell">键鼠锁定控制（case 6 lock / case 0x0E unlock）</span>
+            <span role="cell">黑屏状态与提示；COMD case 6/0x0E 负责输入锁定与解锁</span>
           </div>
         </div>
       </section>
@@ -199,38 +219,35 @@
         <div class="section-intro">
           <p class="eyebrow">Launch</p>
           <h2>本地运行</h2>
-          <p>准备 Python 3.8+、Pillow、Windows 网络环境，并确保测试设备处于合法授权的同一二层网络。</p>
+          <p>需要 Python 3.8+ 和 Windows。请确保教师机与测试学生机处于合法授权的同一网络。</p>
         </div>
         <div class="run-grid">
-          <div class="code-window" aria-label="运行命令">
+          <div class="code-window" aria-label="安装与运行命令">
             <div class="console-head">
               <span class="dot red"></span>
               <span class="dot amber"></span>
               <span class="dot green"></span>
               <span class="console-title">PowerShell</span>
             </div>
-            <pre><code>pip install Pillow
+            <pre><code>pip install Pillow imageio-ffmpeg
 python "teacher_sim .py"</code></pre>
+            <p class="code-note">OpenCV 仅用于可选的 JPEG 显示回退：<code>pip install opencv-python</code></p>
           </div>
           <div class="command-list">
-            <h3>交互命令</h3>
-            <p><code>list</code> 列出已登录学生（含建档信息）</p>
-            <p><code>preview &lt;ip&gt;</code> 请求屏幕缩略图</p>
-            <p><code>all</code> 请求所有学生缩略图</p>
-            <p><code>info &lt;ip&gt; [0|1|2]</code> 请求学生信息（系统/进程/窗口）</p>
-            <p><code>ps / wins &lt;ip&gt;</code> 查看进程 / 窗口列表</p>
-            <p><code>kill &lt;ip&gt; &lt;pid|进程名&gt;</code> 结束学生进程</p>
-            <p><code>closeapp &lt;ip&gt; &lt;hwnd|标题&gt;</code> 结束应用程序</p>
-            <p><code>openurl &lt;ip&gt; &lt;网址&gt;</code> 学生机打开网页</p>
-            <p><code>run &lt;ip&gt; &lt;路径&gt;</code> 远程运行程序</p>
-            <p><code>blackscreen / bs &lt;ip&gt;</code> 黑屏 + 锁键鼠</p>
-            <p><code>unlock &lt;ip&gt;</code> 解锁黑屏与键鼠</p>
-            <p><code>bsall [lock] [text]</code> 全员黑屏</p>
-            <p><code>shutdown / sd &lt;ip&gt; [秒] [文字]</code> 远程关机</p>
-            <p><code>reboot / rb &lt;ip&gt; [秒] [文字]</code> 远程重启</p>
-            <p><code>msg &lt;ip&gt; &lt;text&gt;</code> 发送聊天消息</p>
+            <h3>观看与控制</h3>
+            <p><code>view_probe &lt;ip&gt;</code> 仅探测 4806/TCP</p>
+            <p><code>view &lt;ip&gt;</code> 开始连续观看</p>
+            <p><code>view_stop &lt;ip&gt;</code> 停止连续观看</p>
+            <p><code>control &lt;ip&gt;</code> 打开远程控制窗口</p>
+            <p><code>control_stop &lt;ip&gt;</code> 停止远程控制</p>
+            <p><code>mouse &lt;ip&gt; ...</code> 手动发送鼠标事件</p>
+            <p><code>key &lt;ip&gt; ...</code> 实验性键盘事件</p>
           </div>
         </div>
+        <div class="command-strip" aria-label="其他命令">
+          <code>list</code><code>preview</code><code>info</code><code>ps</code><code>wins</code><code>kill</code><code>closeapp</code><code>openurl</code><code>run</code><code>blackscreen</code><code>unlock</code><code>shutdown</code><code>reboot</code><code>msg</code>
+        </div>
+        <p class="run-warning">先执行 <code>view_probe</code>。连接失败后等待 60 秒冷却，不要连续重复触发学生端编码器。</p>
       </section>
 
       <section class="section safety" id="safety">
@@ -245,8 +262,8 @@ python "teacher_sim .py"</code></pre>
     </main>
 
     <footer class="footer">
-      <span>MIT License</span>
-      <span>Protocol notes for security research</span>
+      <span>2026.07.31 Research Preview</span>
+      <span>MIT License · Protocol notes for security research</span>
     </footer>
 
     <script src="script.js"></script>
